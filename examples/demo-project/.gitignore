@@ -1,0 +1,4 @@
+node_modules/
+
+# Run logs must survive `git clean -fd` between tasks, so they stay ignored.
+.nightshift/

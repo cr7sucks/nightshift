@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "nightshift task result",
+  "description": "The structured verdict a worker agent returns for one task. Passed to `claude --json-schema`. Note: this is the agent's CLAIM, not the decision. The runner independently re-runs the verify gates and its result is what determines whether the task is committed.",
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["done", "partial", "blocked"],
+      "description": "done = acceptance criteria met and verify passed locally. partial = real progress but not finished. blocked = needs a human decision; pair with blocker_question."
+    },
+    "summary": {
+      "type": "string",
+      "description": "What you actually changed and why, in a few sentences. This is read by a human at 8am with no other context."
+    },
+    "files_changed": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Repo-relative paths you created or modified."
+    },
+    "verification_claim": {
+      "type": "string",
+      "description": "Which verify commands you ran yourself and what they returned."
+    },
+    "blocker_question": {
+      "type": "string",
+      "description": "Required when status is blocked. One specific question a human can answer in a sentence. Not 'how should I do this?' but 'should orders without a customer_id be excluded or grouped under NULL?'"
+    }
+  },
+  "required": ["status", "summary"]
+}

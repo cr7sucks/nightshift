@@ -1,0 +1,30 @@
+{
+  "branch_prefix": "nightshift/",
+
+  "verify": {
+    "syntax": "npm run --silent syntax",
+    "test": "npm test"
+  },
+  "baseline_must_pass": true,
+  "verify_timeout_sec": 120,
+  "agent_timeout_sec": 600,
+
+  "model": "sonnet",
+  "fallback_model": "sonnet",
+
+  "caps": {
+    "wall_clock_hours": 1,
+    "total_budget_usd": 5,
+    "per_task_budget_usd": 1,
+    "max_consecutive_failures": 4,
+    "min_task_duration_sec": 15,
+    "max_infra_failures": 2
+  },
+
+  "forbidden_paths": [
+    ".env",
+    ".env.*",
+    "secrets/",
+    ".git/"
+  ]
+}

@@ -1,0 +1,47 @@
+{
+  "branch_prefix": "nightshift/",
+  "plan_file": "NIGHT_PLAN.md",
+  "report_file": "NIGHT_REPORT.md",
+
+  "verify": {
+    "typecheck": "npm run typecheck",
+    "test": "npm test",
+    "build": "npm run build"
+  },
+  "baseline_must_pass": true,
+  "verify_timeout_sec": 900,
+  "agent_timeout_sec": 1800,
+
+  "model": "opus",
+  "fallback_model": "sonnet",
+  "permission_mode": "acceptEdits",
+
+  "caps": {
+    "wall_clock_hours": 8,
+    "total_budget_usd": 40,
+    "per_task_budget_usd": 3,
+    "max_consecutive_failures": 3,
+    "min_task_duration_sec": 20,
+    "max_infra_failures": 2
+  },
+
+  "forbidden_paths": [
+    ".env",
+    ".env.*",
+    "secrets/",
+    ".github/workflows/",
+    ".git/"
+  ],
+
+  "disallowed_tools": [
+    "Bash(git push:*)",
+    "Bash(git remote:*)",
+    "Bash(gh:*)",
+    "Bash(npm publish:*)",
+    "Bash(rm -rf:*)",
+    "Bash(sudo:*)",
+    "Bash(curl:*)",
+    "Bash(shutdown:*)",
+    "WebFetch"
+  ]
+}

@@ -1,0 +1,8 @@
+node_modules/
+.DS_Store
+
+# nightshift run logs (must stay ignored so they survive task resets)
+.nightshift/
+
+# sandbox created by `nightshift demo`
+nightshift-demo/

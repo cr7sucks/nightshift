@@ -1,0 +1,11 @@
+{
+  "name": "nightshift-demo",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A deliberately small project for watching nightshift work. Zero dependencies — the test runner is Node's own.",
+  "scripts": {
+    "test": "node --test",
+    "syntax": "node --check src/cart.js"
+  }
+}
