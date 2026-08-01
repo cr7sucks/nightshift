@@ -172,10 +172,32 @@ node nightshift.mjs preflight     # safety checks only, changes nothing
 node nightshift.mjs run --dry-run # full loop, stubbed agent, $0
 node nightshift.mjs run           # the real thing
 node nightshift.mjs status        # current queue state
+node nightshift.mjs dashboard     # browse your runs in a browser
 node nightshift.mjs demo          # create the sandbox project
 ```
 
 Exit codes: `0` everything landed · `1` refused to start · `2` finished with blocked tasks · `3` a cap or the circuit breaker stopped the run early.
+
+## The dashboard
+
+```bash
+node nightshift.mjs dashboard          # http://localhost:4747
+node nightshift.mjs dashboard --port 8080 --no-open
+```
+
+Every run already writes an event stream, per-task cost and turn counts, and full verify output to `.nightshift/runs/`. `NIGHT_REPORT.md` summarises the end state; the dashboard shows the shape of the night.
+
+- **While it runs** — which task is active, elapsed time, spend so far. It polls only while a run is actually live, then stops.
+- **In the morning** — a timeline bar per task split into **agent**, **verify**, and **unaccounted** time; blockers and the agent's questions pinned to the top; verify output one click away.
+- **Across nights** — every run listed with what landed, what blocked, and what it cost.
+
+Two things get their own callout because they are the ones you would otherwise miss:
+
+**Tasks the gate caught.** When the agent reports `done` and verification disagrees, that task is called out by name. It is the tool's central claim, made visible.
+
+**Unexplained wall clock.** Each task's duration is compared against the agent call plus the gates. When the remainder is larger than the agent call itself, it's flagged. This exists because a real run once spent 1663 seconds of wall clock on a 90-second agent session and nothing surfaced it — it took picking the numbers apart by hand afterwards to notice.
+
+It is **local and read-only**: bound to `127.0.0.1`, no accounts, no external requests (the page works offline), and no endpoint that writes, deletes, or executes anything. Your run data — which includes source excerpts and verify output — never leaves the machine.
 
 ## Preflight refuses to start when
 

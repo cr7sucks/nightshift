@@ -14,6 +14,7 @@
 
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 
 const VERSION = '0.1.0';
@@ -1291,6 +1292,521 @@ function writeReport({ root, cfg, plan, run, opts, branch }) {
 }
 
 // ---------------------------------------------------------------------------
+// dashboard — read-only view of the runs already on disk
+//
+// Everything here reads `.nightshift/runs/<id>/`, which the loop already writes.
+// Nothing in this section mutates anything or shells out; the dashboard's only
+// job is to make data that already exists legible.
+// ---------------------------------------------------------------------------
+
+const DASHBOARD_PORT = 4747;
+
+function runsDir(root) {
+  return path.join(root, '.nightshift', 'runs');
+}
+
+function readJson(p) {
+  try {
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Assemble one run from its three artefact types.
+ *
+ * The interesting derived number is `unaccountedMs` — wall-clock time inside a
+ * task that neither the agent call nor verification explains. A live run once
+ * showed 1663s of wall clock around a 90s agent session and nothing surfaced it.
+ */
+function readRun(dir, id) {
+  const events = [];
+  const logPath = path.join(dir, 'run.jsonl');
+  if (fs.existsSync(logPath)) {
+    for (const line of fs.readFileSync(logPath, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        events.push(JSON.parse(line));
+      } catch {
+        // A half-written final line is expected while a run is in flight.
+      }
+    }
+  }
+
+  const byTask = new Map();
+  const task = (tid) => {
+    if (!byTask.has(tid)) byTask.set(tid, { id: tid, status: 'running', events: [] });
+    return byTask.get(tid);
+  };
+
+  let startedAt = null;
+  let endedAt = null;
+  let branch = null;
+  let abortReason = null;
+  let dryRun = false;
+
+  for (const e of events) {
+    const at = Date.parse(e.at);
+    if (e.event === 'run_start') {
+      startedAt = at;
+      branch = e.branch || null;
+      dryRun = !!e.dryRun;
+    }
+    if (e.event === 'run_end') endedAt = at;
+    if (e.event === 'abort' || e.event === 'plan_limit_abort') abortReason = e.reason || e.detail || 'stopped early';
+    if (!e.task) continue;
+
+    const t = task(e.task);
+    t.events.push(e);
+    if (e.event === 'task_start') t.startedAt = at;
+    if (e.event === 'agent_done') {
+      t.agentMs = e.durationMs ?? null;
+      t.sessionMs = e.sessionMs ?? null;
+      t.apiMs = e.apiMs ?? null;
+      t.numTurns = e.numTurns ?? null;
+      t.cost = e.cost_usd ?? 0;
+    }
+    if (e.event === 'verify_done') {
+      t.verifyMs = e.durationMs ?? null;
+      t.verifyPassed = e.passed;
+    }
+    if (e.event === 'task_done') {
+      t.status = 'done';
+      t.durationMs = e.durationMs ?? null;
+      t.endedAt = at;
+    }
+    // Three different events all end a task as "blocked", and they are not the
+    // same story. Keep the distinction — an agent that claimed done and was
+    // caught by the gate is the single most important thing on the page.
+    if (e.event === 'task_blocked') {
+      t.status = 'blocked';
+      t.endedAt = at;
+      t.reason = e.reason || null;
+      t.kind = 'agent';
+    }
+    if (e.event === 'verify_failed') {
+      t.status = 'blocked';
+      t.endedAt = at;
+      t.kind = 'verify';
+      t.failedGate = e.gate || null;
+      t.agentClaimed = e.agentClaimed || null;
+      t.reason = `verify "${e.gate}" failed (exit ${e.code})`;
+      t.caughtLie = e.agentClaimed === 'done';
+    }
+    if (e.event === 'forbidden_path') {
+      t.status = 'blocked';
+      t.endedAt = at;
+      t.kind = 'forbidden';
+      t.reason = `touched forbidden path ${e.path} (matches "${e.pattern}")`;
+    }
+    if (e.event === 'plan_write_reverted') t.planWriteReverted = true;
+    if (e.event === 'task_skipped') t.status = 'skipped';
+    if (e.event === 'infra_failure') {
+      t.status = 'infra';
+      t.endedAt = at;
+      t.reason = e.error || null;
+    }
+    if (e.event === 'plan_limit_wait') {
+      t.planLimitWaits = (t.planLimitWaits || 0) + 1;
+      t.planLimitMs = (t.planLimitMs || 0) + (e.waitMs || 0);
+    }
+  }
+
+  // Per-task detail lives in sibling files rather than the event stream.
+  for (const [tid, t] of byTask) {
+    const agent = readJson(path.join(dir, `${tid}.agent.json`));
+    if (agent) {
+      t.summary = agent.verdict?.summary ?? null;
+      t.question = agent.verdict?.blocker_question ?? null;
+      t.filesChanged = agent.verdict?.files_changed ?? null;
+      t.error = agent.error ?? null;
+      if (t.cost == null) t.cost = agent.envelope?.total_cost_usd ?? 0;
+    }
+    const verify = readJson(path.join(dir, `${tid}.verify.json`));
+    if (verify) {
+      t.gates = (verify.results || []).map((r) => ({
+        name: r.name,
+        cmd: r.cmd,
+        passed: r.passed,
+        code: r.code,
+        timedOut: !!r.timedOut,
+        output: typeof r.output === 'string' ? r.output.slice(-4000) : '',
+      }));
+    }
+
+    // Only `task_done` carries a duration, so blocked tasks would otherwise show
+    // nothing at all — exactly the ones worth looking at. Fall back to the span
+    // between the task starting and whatever ended it.
+    if (t.durationMs == null && t.startedAt != null && t.endedAt != null) {
+      t.durationMs = t.endedAt - t.startedAt;
+    }
+    // Never terminated. If the run is still going that's genuine elapsed time;
+    // if the run already stopped, the task died with it — clamp to the run's end
+    // rather than letting it accrue against the clock forever.
+    if (t.durationMs == null && t.status === 'running' && t.startedAt != null) {
+      const until = endedAt ?? Date.now();
+      t.durationMs = Math.max(0, until - t.startedAt);
+      t.elapsed = endedAt == null;
+      if (endedAt != null) t.status = 'abandoned';
+    }
+
+    // Wall clock the agent call and the gates together don't account for.
+    if (t.durationMs != null) {
+      const known = (t.agentMs || 0) + (t.verifyMs || 0);
+      t.unaccountedMs = Math.max(0, t.durationMs - known);
+    }
+
+    // Only worth flagging on a task that actually ran to completion. A task
+    // still in flight, or one abandoned when the run stopped, has unexplained
+    // time by definition — that is not the anomaly this is looking for.
+    t.unexplained =
+      (t.status === 'done' || t.status === 'blocked') &&
+      t.agentMs != null &&
+      (t.unaccountedMs || 0) > (t.agentMs || 0) &&
+      (t.unaccountedMs || 0) > 5000;
+  }
+
+  const tasks = [...byTask.values()];
+  const live = startedAt != null && endedAt == null;
+  const counts = {
+    done: tasks.filter((t) => t.status === 'done').length,
+    blocked: tasks.filter((t) => t.status === 'blocked').length,
+    skipped: tasks.filter((t) => t.status === 'skipped').length,
+  };
+
+  return {
+    id,
+    live,
+    dryRun,
+    branch,
+    abortReason,
+    startedAt,
+    endedAt,
+    durationMs: (endedAt ?? Date.now()) - (startedAt ?? Date.now()),
+    spend: tasks.reduce((s, t) => s + (t.cost || 0), 0),
+    counts,
+    tasks,
+    recentEvents: events.slice(-40),
+  };
+}
+
+/** Every run on this machine, newest first. Summary only — detail is per-run. */
+function readAllRuns(root) {
+  const base = runsDir(root);
+  if (!fs.existsSync(base)) return [];
+  const ids = fs
+    .readdirSync(base, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => d.name)
+    .sort()
+    .reverse();
+  return ids.map((id) => {
+    const r = readRun(path.join(base, id), id);
+    return {
+      id: r.id,
+      live: r.live,
+      dryRun: r.dryRun,
+      branch: r.branch,
+      abortReason: r.abortReason,
+      startedAt: r.startedAt,
+      durationMs: r.durationMs,
+      spend: r.spend,
+      counts: r.counts,
+      taskCount: r.tasks.length,
+    };
+  });
+}
+
+/**
+ * Resolve a URL-supplied run id to a directory.
+ *
+ * The id is never joined to a path directly — it has to match a real entry, so
+ * `../../etc` and friends resolve to nothing rather than escaping the runs dir.
+ */
+function resolveRunDir(root, id) {
+  const base = runsDir(root);
+  if (!fs.existsSync(base)) return null;
+  const known = fs
+    .readdirSync(base, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => d.name);
+  if (!known.includes(id)) return null;
+  return path.join(base, id);
+}
+
+/**
+ * The whole page: markup, styles, and script inline.
+ *
+ * No external requests by design — it must render with no network, and run data
+ * (source excerpts, verify output) must never be handed to a third party.
+ */
+const DASHBOARD_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>nightshift</title>
+<style>
+  :root {
+    --bg:#f6f7f9; --panel:#fff; --line:#e2e5ea; --fg:#14171c; --dim:#6b7280;
+    --done:#16a34a; --blocked:#d97706; --skipped:#9ca3af; --infra:#dc2626;
+    --agent:#6366f1; --verify:#0891b2; --unacc:#e11d48; --live:#16a34a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0b0e14; --panel:#11151d; --line:#232936; --fg:#e6e9ef; --dim:#8b93a3;
+      --done:#4ade80; --blocked:#fbbf24; --skipped:#6b7280; --infra:#f87171;
+      --agent:#818cf8; --verify:#22d3ee; --unacc:#fb7185; --live:#4ade80;
+    }
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--fg);
+    font:14px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  header {
+    padding:14px 20px; border-bottom:1px solid var(--line); background:var(--panel);
+    display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+  }
+  h1 { font-size:15px; margin:0; letter-spacing:.02em; }
+  .muted { color:var(--dim); }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .wrap { display:flex; align-items:flex-start; gap:20px; padding:20px; flex-wrap:wrap; }
+  .side { flex:0 0 270px; min-width:230px; }
+  .main { flex:1 1 460px; min-width:0; }
+  .card {
+    background:var(--panel); border:1px solid var(--line);
+    border-radius:10px; padding:14px; margin-bottom:14px;
+  }
+  .runbtn {
+    display:block; width:100%; text-align:left; cursor:pointer;
+    background:var(--panel); border:1px solid var(--line); color:var(--fg);
+    border-radius:8px; padding:9px 11px; margin-bottom:7px; font:inherit;
+  }
+  .runbtn:hover { border-color:var(--dim); }
+  .runbtn.sel { border-color:var(--agent); box-shadow:0 0 0 1px var(--agent); }
+  .pill {
+    display:inline-block; padding:1px 8px; border-radius:99px;
+    font-size:11px; font-weight:700; letter-spacing:.04em; text-transform:uppercase;
+  }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:99px; margin-right:5px; }
+  .blink { animation:b 1.4s ease-in-out infinite; }
+  @keyframes b { 50% { opacity:.25; } }
+  .bar { display:flex; height:9px; border-radius:99px; overflow:hidden; background:var(--line); }
+  .bar span { display:block; height:100%; }
+  .legend { display:flex; gap:14px; flex-wrap:wrap; font-size:12px; }
+  .kv { display:flex; gap:18px; flex-wrap:wrap; }
+  .kv div { min-width:88px; }
+  .kv b { display:block; font-size:19px; font-variant-numeric:tabular-nums; }
+  table { width:100%; border-collapse:collapse; }
+  th,td { text-align:left; padding:6px 9px; border-bottom:1px solid var(--line); font-size:13px; }
+  th { color:var(--dim); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  pre {
+    background:var(--bg); border:1px solid var(--line); border-radius:7px;
+    padding:10px; overflow-x:auto; font-size:12px; margin:8px 0 0;
+  }
+  details summary { cursor:pointer; color:var(--dim); font-size:12px; }
+  .warn {
+    border-left:3px solid var(--unacc); padding-left:10px;
+    background:color-mix(in srgb, var(--unacc) 8%, transparent);
+  }
+  .q { border-left:3px solid var(--blocked); padding:8px 12px; margin:8px 0; }
+  .scroll { overflow-x:auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>nightshift</h1>
+  <span class="muted mono" id="repo"></span>
+  <span class="muted" style="margin-left:auto">local &middot; read-only</span>
+</header>
+<div class="wrap">
+  <div class="side">
+    <div class="muted" style="margin-bottom:8px">Runs</div>
+    <div id="runs"></div>
+  </div>
+  <div class="main" id="detail"></div>
+</div>
+<script>
+var SEL = null, TIMER = null;
+
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+function ms(n) {
+  if (n == null) return '-';
+  if (n < 1000) return n + 'ms';
+  if (n < 60000) return (n/1000).toFixed(1) + 's';
+  // floor, not round — rounding the minutes up and then adding the leftover
+  // seconds reports 90s as "2m 30s".
+  return Math.floor(n/60000) + 'm ' + Math.round((n%60000)/1000) + 's';
+}
+function usd(n) { return '$' + (n || 0).toFixed(2); }
+function when(t) { return t ? new Date(t).toLocaleString() : '-'; }
+function colorFor(st) {
+  return st === 'done' ? 'var(--done)'
+    : st === 'blocked' ? 'var(--blocked)'
+    : st === 'infra' ? 'var(--infra)'
+    : st === 'skipped' || st === 'abandoned' ? 'var(--skipped)' : 'var(--agent)';
+}
+
+function drawRuns(runs) {
+  var el = document.getElementById('runs');
+  if (!runs.length) {
+    el.innerHTML = '<div class="card muted">No runs yet. Start one with <span class="mono">nightshift run</span>.</div>';
+    return;
+  }
+  el.innerHTML = runs.map(function(r) {
+    var live = r.live
+      ? '<span class="pill blink" style="background:var(--live);color:#04140a">live</span> '
+      : '';
+    var dry = r.dryRun ? '<span class="pill" style="background:var(--line);color:var(--dim)">dry</span> ' : '';
+    return '<button class="runbtn' + (r.id === SEL ? ' sel' : '') + '" data-id="' + esc(r.id) + '">'
+      + '<div>' + live + dry + '<span class="mono" style="font-size:12px">' + esc(r.id) + '</span></div>'
+      + '<div class="muted" style="font-size:12px;margin-top:3px">'
+      + r.counts.done + ' done &middot; ' + r.counts.blocked + ' blocked &middot; '
+      + usd(r.spend) + ' &middot; ' + ms(r.durationMs)
+      + '</div></button>';
+  }).join('');
+  Array.prototype.forEach.call(el.querySelectorAll('.runbtn'), function(b) {
+    b.onclick = function() { select(b.getAttribute('data-id')); };
+  });
+}
+
+function taskRow(t, max) {
+  var a = t.agentMs || 0, v = t.verifyMs || 0, u = t.unaccountedMs || 0;
+  var total = t.durationMs || (a + v + u) || 1;
+  var width = Math.max(2, Math.round((total / max) * 100));
+  var odd = t.unexplained;
+  var seg = function(w, c, label) {
+    return w <= 0 ? '' : '<span style="width:' + ((w/total)*100) + '%;background:' + c + '" title="' + label + ' ' + ms(w) + '"></span>';
+  };
+  return '<tr>'
+    + '<td><span class="dot" style="background:' + colorFor(t.status) + '"></span><span class="mono">' + esc(t.id) + '</span></td>'
+    + '<td style="width:44%"><div class="bar" style="width:' + width + '%">'
+      + seg(a, 'var(--agent)', 'agent') + seg(v, 'var(--verify)', 'verify') + seg(u, 'var(--unacc)', 'unaccounted')
+      + '</div></td>'
+    + '<td class="num">' + ms(t.durationMs) + '</td>'
+    + '<td class="num">' + (t.numTurns == null ? '-' : t.numTurns) + '</td>'
+    + '<td class="num">' + usd(t.cost) + '</td>'
+    + '<td>' + (odd ? '<span style="color:var(--unacc)" title="Wall clock this run cannot explain">&#9888; ' + ms(u) + ' unexplained</span>' : '<span class="muted">' + esc(t.status) + '</span>') + '</td>'
+    + '</tr>';
+}
+
+function drawDetail(r) {
+  var max = Math.max.apply(null, r.tasks.map(function(t) { return t.durationMs || 1; }).concat([1]));
+  var questions = r.tasks.filter(function(t) { return t.question; });
+  var odd = r.tasks.filter(function(t) { return t.unexplained; });
+
+  var h = '';
+  h += '<div class="card"><div class="kv">'
+    + '<div><b>' + r.counts.done + '</b><span class="muted">done</span></div>'
+    + '<div><b>' + r.counts.blocked + '</b><span class="muted">blocked</span></div>'
+    + '<div><b>' + r.counts.skipped + '</b><span class="muted">skipped</span></div>'
+    + '<div><b>' + usd(r.spend) + '</b><span class="muted">' + (r.dryRun ? 'simulated' : 'est. spend') + '</span></div>'
+    + '<div><b>' + ms(r.durationMs) + '</b><span class="muted">' + (r.live ? 'elapsed' : 'duration') + '</span></div>'
+    + '</div>'
+    + '<div class="muted" style="margin-top:10px;font-size:12px">'
+      + (r.branch ? 'branch <span class="mono">' + esc(r.branch) + '</span> &middot; ' : '')
+      + 'started ' + when(r.startedAt)
+      + (r.live ? ' &middot; <span style="color:var(--live)">running now</span>' : '')
+    + '</div>'
+    + (r.abortReason ? '<div class="q" style="border-color:var(--infra)"><b>Stopped early.</b> ' + esc(r.abortReason) + '</div>' : '')
+    + '</div>';
+
+  var caught = r.tasks.filter(function(t) { return t.caughtLie; });
+  if (caught.length) {
+    h += '<div class="card warn"><b>The gate caught a false claim</b>'
+      + '<div class="muted" style="font-size:13px;margin-top:4px">'
+      + 'The agent reported these done. Verification disagreed and the work was reverted &mdash; '
+      + 'nothing from them is on the branch.</div>'
+      + caught.map(function(t) {
+          return '<div class="q" style="border-color:var(--unacc)"><span class="mono">' + esc(t.id)
+            + '</span> &mdash; failed gate <span class="mono">' + esc(t.failedGate) + '</span></div>';
+        }).join('')
+      + '</div>';
+  }
+
+  if (questions.length) {
+    h += '<div class="card"><b>The agent stopped rather than guess</b>'
+      + questions.map(function(t) {
+          return '<div class="q"><span class="mono">' + esc(t.id) + '</span> &mdash; ' + esc(t.question) + '</div>';
+        }).join('')
+      + '</div>';
+  }
+
+  if (odd.length) {
+    h += '<div class="card warn"><b>Unexplained wall clock</b><div class="muted" style="font-size:13px;margin-top:4px">'
+      + odd.map(function(t) {
+          return esc(t.id) + ' took ' + ms(t.durationMs) + ' but the agent call was only ' + ms(t.agentMs)
+            + ' and verification ' + ms(t.verifyMs) + '.';
+        }).join(' ')
+      + ' Time inside the task that neither the agent nor the gates account for.</div></div>';
+  }
+
+  h += '<div class="card"><div class="scroll"><table>'
+    + '<tr><th>Task</th><th>Timeline</th><th class="num">Wall</th><th class="num">Turns</th><th class="num">Cost</th><th>State</th></tr>'
+    + r.tasks.map(function(t) { return taskRow(t, max); }).join('')
+    + '</table></div>'
+    + '<div class="legend muted" style="margin-top:10px">'
+      + '<span><span class="dot" style="background:var(--agent)"></span>agent</span>'
+      + '<span><span class="dot" style="background:var(--verify)"></span>verify</span>'
+      + '<span><span class="dot" style="background:var(--unacc)"></span>unaccounted</span>'
+    + '</div></div>';
+
+  h += r.tasks.map(function(t) {
+    var body = '';
+    if (t.summary) body += '<div style="margin:6px 0">' + esc(t.summary) + '</div>';
+    if (t.reason) body += '<div class="muted" style="margin:6px 0">' + esc(t.reason) + '</div>';
+    if (t.error) body += '<div style="color:var(--infra);margin:6px 0">' + esc(t.error) + '</div>';
+    if (t.gates && t.gates.length) {
+      body += t.gates.map(function(g) {
+        return '<details><summary>' + (g.passed ? '&#10003;' : '&#10007;') + ' ' + esc(g.name)
+          + ' <span class="mono">' + esc(g.cmd) + '</span></summary><pre>' + esc(g.output || '(no output)') + '</pre></details>';
+      }).join('');
+    }
+    if (!body) return '';
+    return '<div class="card"><b class="mono">' + esc(t.id) + '</b> '
+      + '<span class="pill" style="background:' + colorFor(t.status) + ';color:#04140a">' + esc(t.status) + '</span>'
+      + body + '</div>';
+  }).join('');
+
+  document.getElementById('detail').innerHTML = h;
+}
+
+function select(id) {
+  SEL = id;
+  load();
+}
+
+function load() {
+  fetch('/api/runs').then(function(r) { return r.json(); }).then(function(runs) {
+    document.getElementById('repo').textContent = runs.repo || '';
+    var list = runs.runs || [];
+    if (!SEL && list.length) SEL = list[0].id;
+    drawRuns(list);
+    if (!SEL) { document.getElementById('detail').innerHTML = ''; return; }
+    return fetch('/api/runs/' + encodeURIComponent(SEL))
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(run) {
+        if (!run) return;
+        drawDetail(run);
+        // Poll only while something is actually happening.
+        clearTimeout(TIMER);
+        if (run.live) TIMER = setTimeout(load, 2000);
+      });
+  });
+}
+load();
+</script>
+</body>
+</html>`;
+
+// ---------------------------------------------------------------------------
 // commands
 // ---------------------------------------------------------------------------
 
@@ -1482,6 +1998,78 @@ function cmdStatus(opts) {
   return 0;
 }
 
+function cmdDashboard(opts) {
+  const { root } = resolveContext(opts);
+  const port = Number.isFinite(opts.port) && opts.port > 0 ? opts.port : DASHBOARD_PORT;
+
+  const send = (res, code, type, body) => {
+    res.writeHead(code, { 'content-type': type, 'cache-control': 'no-store' });
+    res.end(body);
+  };
+  const json = (res, code, obj) => send(res, code, 'application/json; charset=utf-8', JSON.stringify(obj));
+
+  const server = http.createServer((req, res) => {
+    // Read-only surface: nothing here writes, deletes, or executes.
+    if (req.method !== 'GET') return json(res, 405, { error: 'read-only' });
+
+    let url;
+    try {
+      url = new URL(req.url, 'http://localhost');
+    } catch {
+      return json(res, 400, { error: 'bad request' });
+    }
+    const p = url.pathname;
+
+    if (p === '/' || p === '/index.html') {
+      return send(res, 200, 'text/html; charset=utf-8', DASHBOARD_HTML);
+    }
+    if (p === '/api/runs') {
+      return json(res, 200, { repo: path.basename(root), runs: readAllRuns(root) });
+    }
+    if (p.startsWith('/api/runs/')) {
+      const id = decodeURIComponent(p.slice('/api/runs/'.length));
+      const dir = resolveRunDir(root, id);
+      // Unknown id — including anything trying to climb out of the runs dir.
+      if (!dir) return json(res, 400, { error: 'unknown run' });
+      return json(res, 200, readRun(dir, id));
+    }
+    return json(res, 404, { error: 'not found' });
+  });
+
+  server.on('error', (e) => {
+    if (e.code === 'EADDRINUSE') {
+      err(`port ${port} is already in use — try: nightshift dashboard --port ${port + 1}`);
+      process.exitCode = 1;
+      return;
+    }
+    throw e;
+  });
+
+  // Loopback only. Run data contains source excerpts and verify output; it has
+  // no business being reachable from the network.
+  server.listen(port, '127.0.0.1', () => {
+    const url = `http://localhost:${port}`;
+    log('');
+    ok(`dashboard on ${cyan(url)}`);
+    const runs = readAllRuns(root);
+    const live = runs.find((r) => r.live);
+    info(
+      runs.length
+        ? `${runs.length} run${runs.length === 1 ? '' : 's'} in ${path.relative(root, runsDir(root))}` +
+            (live ? ` · ${green('one is running now')}` : '')
+        : `no runs yet in ${path.relative(root, runsDir(root))}`
+    );
+    log(dim('  reads only — nothing is uploaded, nothing is modified. ctrl-c to stop.'));
+    log('');
+    if (!opts.noOpen && process.platform === 'darwin') {
+      spawnSync('open', [url], { stdio: 'ignore' });
+    }
+  });
+
+  // No need to block: a listening server keeps the event loop alive on its own.
+  return 0;
+}
+
 const HELP = `${bold('nightshift')} ${VERSION} — unattended, verified overnight progress for Claude Code
 
 ${bold('USAGE')}
@@ -1491,6 +2079,7 @@ ${bold('COMMANDS')}
   run              Work the queue in NIGHT_PLAN.md on an isolated branch
   preflight        Run the safety checks only, change nothing
   status           Show the current queue and task statuses
+  dashboard        Browse this machine's runs in a local, read-only web view
   demo             Create a sandbox demo project you can run against
   help             This
 
@@ -1500,6 +2089,8 @@ ${bold('OPTIONS')}
   --plan <path>    Plan file (default: NIGHT_PLAN.md)
   --config <path>  Config file (default: nightshift.config.json)
   --demo-dir <p>   Where the demo command writes the sandbox project
+  --port <n>       Dashboard port (default: 4747)
+  --no-open        Don't open a browser when the dashboard starts
 
 ${bold('THE CONTRACT')}
   The agent proposes, the runner verifies. A task is only "done" when the
@@ -1511,6 +2102,7 @@ ${bold('EXAMPLES')}
   nightshift preflight
   nightshift run --dry-run
   nightshift run
+  nightshift dashboard
 `;
 
 // ---------------------------------------------------------------------------
@@ -1526,6 +2118,8 @@ function parseArgs(argv) {
     else if (a === '--plan') opts.plan = argv[++i];
     else if (a === '--config') opts.config = argv[++i];
     else if (a === '--demo-dir') opts.demoDir = path.resolve(argv[++i]);
+    else if (a === '--port') opts.port = Number(argv[++i]);
+    else if (a === '--no-open') opts.noOpen = true;
     else if (a === '-h' || a === '--help') opts.help = true;
     else if (a === '-v' || a === '--version') opts.version = true;
     else if (a.startsWith('-')) fatal(`Unknown option: ${a}`);
@@ -1551,7 +2145,13 @@ function main() {
     log(HELP);
     return 0;
   }
-  const table = { run: cmdRun, preflight: cmdPreflight, status: cmdStatus, demo: cmdDemo };
+  const table = {
+    run: cmdRun,
+    preflight: cmdPreflight,
+    status: cmdStatus,
+    dashboard: cmdDashboard,
+    demo: cmdDemo,
+  };
   const fn = table[cmd];
   if (!fn) {
     console.error(red(`Unknown command: ${cmd}`));

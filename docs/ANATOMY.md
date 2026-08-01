@@ -103,3 +103,24 @@ Be clear-eyed about the boundaries:
 | `.nightshift/runs/<id>/<T>.verify.json` | Runner | Every gate's exit code and output |
 
 When a night goes wrong, `run.jsonl` is the ground truth.
+
+## The run directory is a contract
+
+`nightshift dashboard` reads `.nightshift/runs/` directly. That makes the layout above, and the event names in `run.jsonl`, a consumed interface rather than an internal detail — renaming an event silently breaks the dashboard, because there is no schema to fail against.
+
+Events the dashboard depends on:
+
+| Event | Carries |
+|---|---|
+| `run_start` / `run_end` | branch, dry-run flag. **Absence of `run_end` is how a live run is detected** — there is no lockfile or PID |
+| `task_start` | begins a task's wall clock |
+| `agent_done` | `durationMs`, `sessionMs`, `apiMs`, `numTurns`, `cost_usd` |
+| `verify_done` | gate wall time and pass/fail |
+| `task_done` | the task's total `durationMs` |
+| `task_blocked` / `verify_failed` / `forbidden_path` | three *different* events that all end a task as blocked |
+| `task_skipped`, `infra_failure`, `plan_limit_wait`, `plan_limit_abort`, `abort` | everything else that ends a task or a run |
+
+Two traps worth knowing before you change any of this:
+
+- **Only `task_done` carries a duration.** Blocked tasks — the ones most worth looking at — have to have theirs derived from `task_start` to whichever event ended them.
+- **Three events mean "blocked" and they are not interchangeable.** `verify_failed` with `agentClaimed: "done"` is the agent being caught by the gate, which is a different story from an agent that stopped to ask a question. Collapsing them loses the distinction the whole tool exists to draw.
