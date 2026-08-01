@@ -16,13 +16,15 @@
   "fallback_model": "sonnet",
   "permission_mode": "acceptEdits",
 
+  "_caps_note": "On a Claude subscription the *_usd caps are ESTIMATES, not charges — a proxy for how much of your usage window a run may consume. They are real spend limits only if ANTHROPIC_API_KEY is set. Preflight prints which mode it detected.",
   "caps": {
     "wall_clock_hours": 8,
     "total_budget_usd": 40,
     "per_task_budget_usd": 3,
     "max_consecutive_failures": 3,
     "min_task_duration_sec": 20,
-    "max_infra_failures": 2
+    "max_infra_failures": 2,
+    "max_plan_limit_waits": 3
   },
 
   "forbidden_paths": [

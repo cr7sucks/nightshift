@@ -752,6 +752,21 @@ function authSmokeTest(cfg) {
   return { ok: true, cost: env.total_cost_usd || 0 };
 }
 
+/**
+ * Which wallet a night run draws from. This changes what the caps below mean, so
+ * preflight says it out loud rather than letting a subscription user read
+ * "$40 budget" as a bill they're about to receive.
+ */
+function authMode() {
+  if (process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN) {
+    return { kind: 'api', label: 'API key — billed per token, so the caps below are real money' };
+  }
+  return {
+    kind: 'subscription',
+    label: 'Claude subscription — draws on your plan, not a card; $ figures below are estimates',
+  };
+}
+
 function preflight(root, cfg, plan, opts) {
   const problems = [];
   const notes = [];
@@ -774,12 +789,13 @@ function preflight(root, cfg, plan, opts) {
   if (plan.tasks.length && !pending.length)
     problems.push('plan: no pending tasks (everything is already done/blocked/skipped)');
 
+  const mode = authMode();
   if (!opts.dryRun) {
     const auth = authSmokeTest(cfg);
     if (!auth.ok) problems.push(`agent unreachable: ${auth.reason}`);
-    else notes.push(`agent reachable (smoke test cost $${(auth.cost || 0).toFixed(4)})`);
+    else notes.push(`agent reachable — ${mode.label}`);
   } else {
-    notes.push('dry-run: skipping auth smoke test');
+    notes.push(`dry-run: skipping auth smoke test (${mode.kind === 'api' ? 'API key' : 'Claude subscription'})`);
   }
 
   if (cfg.baseline_must_pass && Object.keys(cfg.verify).length) {
@@ -1352,8 +1368,11 @@ function cmdRun(opts) {
   run.branch = branch;
   run.baseBranch = baseBranch;
   logEvent(run, { event: 'run_start', branch, baseBranch, tasks: plan.tasks.length, dryRun: !!opts.dryRun });
+  // "est." matters: on a subscription these dollars are never charged, and a user
+  // who reads them as a bill will size the caps wrong in both directions.
+  const est = authMode().kind === 'subscription' ? ' est.' : '';
   info(
-    `caps: ${cfg.caps.wall_clock_hours}h · $${cfg.caps.total_budget_usd} total · $${cfg.caps.per_task_budget_usd}/task · ` +
+    `caps: ${cfg.caps.wall_clock_hours}h · $${cfg.caps.total_budget_usd}${est} total · $${cfg.caps.per_task_budget_usd}${est}/task · ` +
       `${cfg.caps.max_consecutive_failures} consecutive failures`
   );
 

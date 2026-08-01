@@ -32,7 +32,8 @@ An unsupervised agent's failure modes are well known and every one of them has a
 | Agent says "done." It isn't. | **The runner re-runs your verify commands itself.** The agent's self-report is a hint, never the gate. Claimed-done-but-red gets reverted and flagged. |
 | One broken task poisons everything after it | Every task is checkpointed. Failure = `git reset --hard` to the checkpoint. **Every commit on the branch is green.** |
 | Quality decays as context fills up | **Fresh session per task.** No accumulated context, no drift. The queue file is the only thing that crosses task boundaries. |
-| Cost runs away while you sleep | Per-task budget, total budget, and a wall-clock deadline. All hard caps. |
+| Cost runs away while you sleep | Per-task budget, total budget, and a wall-clock deadline. All hard caps. On a Claude plan these are estimates, not charges — see [what a night costs](#what-a-night-actually-costs-you). |
+| You hit your plan's usage limit at 2am | The run **waits for the window to reopen and resumes**, instead of reading a fast rejection as a crash and abandoning the queue. |
 | Auth expires at 1am → 40 tasks "fail" in 40 seconds | **Circuit breaker.** Failures that return implausibly fast are treated as infrastructure, not task failures. The run stops and the queue stays re-runnable. |
 | Agent does something destructive | Denied tools (no push, no remote, no `rm -rf`, no `sudo`), a forbidden-paths list, work on a throwaway branch, and **nothing is ever pushed**. |
 | You wake up to one unreviewable 4000-line diff | One commit per task, tasks sized to one commit, per-task diffstat in the report. |
@@ -95,6 +96,26 @@ Then edit `nightshift.config.json` so the verify commands are **your** project's
 ```
 
 **These commands are the whole safety model.** nightshift is exactly as trustworthy as they are strict. A project with no tests gets no protection — the runner has nothing to check the agent against.
+
+---
+
+## What a night actually costs you
+
+nightshift shells out to `claude`, so it spends whatever your CLI is already authenticated with. It never asks for a key of its own. Preflight prints which one it found.
+
+| Your setup | What a run consumes | What the `_usd` caps mean |
+|---|---|---|
+| Logged in with a Claude account (Pro/Max) | Your **plan usage** — rolling windows | An **estimate**. Nothing is charged. Treat the numbers as a proxy for how much of your usage window this run may eat. |
+| `ANTHROPIC_API_KEY` set in your environment | **Billed API credits** | Real money. These are hard spend caps. |
+
+Most Claude Code users are in the first row. If that's you, `"total_budget_usd": 40` does **not** mean you are about to be charged forty dollars — the runner prints it as `$40 est.` to keep that honest.
+
+**On a subscription, the real constraint is your usage window, not dollars.** An 8-hour unattended run is close to a worst case for a rolling limit, so expect to hit one. When that happens the runner **waits for the window to reopen and resumes the queue** rather than treating it as a crash — capped by `caps.max_plan_limit_waits` so a limit that keeps reasserting itself stops the run cleanly instead of spinning until dawn.
+
+Two things worth knowing before your first real night:
+
+- **It competes with you.** Usage spent overnight is usage you don't have in the morning. Start with a short queue and see what it actually costs before trusting it with fifteen tasks.
+- **Rolling limits reset in hours; weekly caps don't.** Running a big queue every night meets the weekly ceiling first.
 
 ---
 

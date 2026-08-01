@@ -92,6 +92,25 @@ Order of effect:
 
 Every run reports actual spend per task in `NIGHT_REPORT.md`. Use real numbers, not guesses.
 
+## "Am I being charged for this?"
+
+Only if `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`) is set in your environment. Preflight tells you which it found:
+
+```
+✓ agent reachable — Claude subscription — usage draws on your plan, not a card...
+✓ agent reachable — API key — usage is billed per token, so the caps below are real money
+```
+
+On a subscription, every dollar figure in the output is an estimate of *equivalent* API spend and is printed as `$40 est.`. Nothing is charged. The `_usd` caps still work — they just limit estimated spend, which is a rough proxy for how much of your usage window the run consumes.
+
+## "The run stopped and said it hit a plan limit"
+
+Expected on a Claude subscription. Rolling usage windows are the normal way a long unattended run ends.
+
+The runner waits for the window to reopen and resumes the queue. It gives up only when the limit persists across `caps.max_plan_limit_waits` attempts (default 3), or when the reset time falls after your `wall_clock_hours` deadline. In both cases unfinished tasks stay `pending`, so re-running picks up where it left off — nothing is lost.
+
+If it happens every night, the queue is too big for one window. Cut it, or lower `caps.wall_clock_hours` so the run ends before it starts fighting the limit.
+
 ## "Can I run it on a schedule?"
 
 You can, but preflight will refuse if the tree is dirty or the baseline is red — which is the correct behaviour and means a cron job will silently no-op some nights. Check the exit code:
